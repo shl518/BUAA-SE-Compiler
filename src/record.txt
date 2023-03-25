@@ -1,0 +1,1107 @@
+import AST.ASTNode;
+import AST.NodeKind;
+import AST.NodeType;
+import CONST.MyError;
+import CONST.OperDiction;
+import Table.*;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+
+public class MidCodeGenerate {
+    private ASTNode tree;
+    private ArrayList<MidCode> midCodes = new ArrayList<>();
+
+    private int varcount = 0;//生成tmp变量
+    private int ifcount = 1;//生成标签
+    private int whilecount = 1;//生成标签
+    private int logicORcount = 1;//生成标签
+
+    private boolean isglobal = true;
+    public static Table headerTable = new Table(null, BlockType.GLOBAL);
+    public static Table foreverGlobalTAble = headerTable;
+    private Symbol curFunc;//当前调用的函数
+    private boolean noneedopenblock = false;    //while、if等自建scope时标记不需再block
+
+    //todo 生成无用函数优化用
+    //private final ArrayList<Symbol> unuseFuncs = new ArrayList<>();
+    //private boolean assignGlobalVar = false;
+    //private boolean assignparaArray = false;
+    //private boolean hasprintstmt = false;
+
+    //private int startindex = 0;//todo 这是干啥的
+
+    public MidCodeGenerate(ASTNode tree) {
+        this.tree = tree;
+    }
+
+    public ArrayList<MidCode> generate() {
+        parseTree();
+        return midCodes;
+    }
+
+    public static void insertTable(Symbol symbol) {
+        headerTable.addSymbol(symbol);
+        symbol.setTable(headerTable);
+    }
+
+    public static void openTable(BlockType blocktype) {
+        Table newTable = new Table(headerTable, blocktype);
+        headerTable.addson(newTable);
+        headerTable = newTable;
+    }
+
+    public static void closeTable() {
+        setScopeForEachSymbol();
+        headerTable = headerTable.getFather();
+    }
+
+    private static void setScopeForEachSymbol() { //todo ？？？？这个有啥用
+        for (Symbol symbol : headerTable.getSymbols()) {
+            symbol.setTable(headerTable);
+        }
+    }
+
+    public void writefile() throws IOException {
+        File file = new File("midcode.txt");
+        FileWriter writer = new FileWriter(file);
+        System.out.println("输出ircode.txt...");
+        for (MidCode irc : midCodes) {
+            String t = irc.getRawstr();
+            System.out.println(t);
+            writer.write(t + " ::Kind is: "+irc.getType()+"\n");
+            //writer.write(t +"\n");
+        }
+        writer.flush();
+        writer.close();
+    }
+
+    public void parseTree() {
+        createIRCode(MidType.Note, "#Start Decl");
+        if (tree.getLeft() != null) {
+            for (ASTNode leaf : tree.getLeft().getLeafs()) {
+                parseDecl(leaf);
+            }
+        }
+        isglobal = false;
+        createIRCode(MidType.Note, "#Start FuncDecl");
+        if (tree.getMiddle() != null) {
+            parseFuncDeclList(tree.getMiddle());
+        }
+        createIRCode(MidType.Note, "#Start MainFunc");
+
+        //main
+        MidCodeGenerate.openTable(BlockType.MAIN);
+        parseBlock(tree.getRight(),-404);
+        MidCodeGenerate.closeTable();
+    }
+
+
+    public void parseDecl(ASTNode n) { // constDef,VarDef
+        for (ASTNode leaf : n.getLeafs()) {
+            parseDef(leaf);
+        }
+    }
+
+    public void parseDef(ASTNode n) {
+        ASTNode ident = n.getLeft();
+        String name = ident.getName();
+        NodeKind kind = ident.getKind();
+
+        //符号表
+        ASTNode init = n.getRight();
+        Symbol symbol = insertTosymbolTable(ident,init);
+
+
+        if (kind.equals(NodeKind.CONSTARRAY) || kind.equals(NodeKind.ARRAY)) {
+            parseArrayDef(n);
+        } else {
+            //symbol.setIrindex(midCodes.size());//todo 干啥的
+
+            if (init != null) {
+                if (kind.equals(NodeKind.CONSTINT) || isglobal) { //isglobal 也直接计算初值，因为这块不可能有函数
+                    int constinitnum = symbol.getNum();
+                    MidCode ir = new MidCode(MidType.intDecl, kind, name);
+                    ir.setNum(constinitnum); //初值
+                    ir.setInitIsTrue();
+                    ir.setSymbol(symbol);
+                    ir4init(ir);
+                } else { //如果是var int ，需要计算表达式，采取一个生成两条的策略
+                    //第一条
+                    MidCode numInitir = new MidCode(MidType.intDecl, kind, name);
+                    numInitir.setSymbol(symbol);
+                    ir4init(numInitir);
+
+                    //第二条
+                    //startindex = midCodes.size(); //初始化复制语句开始位置 todo 干啥的
+
+                    Var intinitVar = parseExp(init);
+                    Var intinitLval = new Var("var", name);
+
+                    intinitLval.setSymbol(symbol);
+                    intinitLval.setiskindofsymbolTrue();//todo 这个干啥的
+
+                    //checkIfAssignGlobalValue(intinitVar);//todo 真的感觉这个没啥用，不用不生成也没提高性能啊
+
+                    MidCode ir = new MidCode(MidType.assign2, intinitLval, intinitVar);
+                    ir4init(ir);
+
+                }
+            } else { //没有初值，可以直接构建
+                MidCode ir = new MidCode(MidType.intDecl, kind, name);
+                ir.setSymbol(symbol);
+                ir4init(ir);
+            }
+        }
+    }
+
+    public void parseArrayDef(ASTNode n) {
+        ASTNode ident = n.getLeft();
+        String name = ident.getName();
+        NodeKind kind = ident.getKind();
+
+        Symbol symbol = lookallTableFindsamename(name);
+        int dimen1num = 0,dimen2num = 0;
+        if(symbol != null){
+            dimen1num = symbol.getDimen1();
+            dimen2num = symbol.getDimen2();
+        }else {
+            MyError.errorat("MudCodegenrate", 172,"为啥没定义？？");
+        }
+
+        MidCode arrayir = new MidCode(MidType.arrayDecl, name, dimen1num, dimen2num);
+        arrayir.setSymbol(symbol);
+
+        //设置初值
+        ASTNode init = n.getRight();
+        if (init != null) {
+            if (kind.equals(NodeKind.CONSTARRAY) || isglobal) {//const array 或者全局，直接填表
+                arrayir.setInitIsTrue();
+                arrayir.addAllInitList(symbol.getArrayValue());
+                ir4init(arrayir);
+            } else {//var 数组有可能有变量函数啥的，需要拆成多条，运行时处理
+                //声明放第一条
+                //todo startindex = midCodes.size();
+                ir4init(arrayir);
+
+                //接下来多条赋值
+                if (dimen2num == 0) { //一维数组
+                    //数组下标也弄成Variable,这里主要是因为有函数存在，数组下标可能是函数调用，我们需要一个变量来记录函数调用的返回值
+                    for (int i = 0; i < dimen1num; i++) {
+                        Var arrIndex = new Var("num", i);
+                        Var arrElementInitvar = parseExp(init.getLeafs().get(i));
+                        Var arrElementInitLval = new Var("array", name, arrIndex);
+
+                        arrElementInitLval.setSymbol(symbol);
+                        arrElementInitLval.setiskindofsymbolTrue();
+
+                        //checkIfAssignGlobalValue(arrElementInitLval);      //检查是否赋值global
+
+                        MidCode ir = new MidCode(MidType.assign2, arrElementInitLval, arrElementInitvar);
+
+
+                        ir4init(ir);
+                    }
+                } else {//二维数组
+                    for (int i = 0; i < dimen1num; i++) {
+                        for (int j = 0; j < dimen2num; j++) {
+                            int index = i * dimen2num + j;
+                            Var arrIndex = new Var("num", index);
+                            Var arrElementInitvar = parseExp(init.getLeafs().get(i).getLeafs().get(j));
+                            Var arrElementInitLval = new Var("array", name, arrIndex);
+
+                            arrElementInitLval.setSymbol(symbol);
+                            arrElementInitLval.setiskindofsymbolTrue();
+                            //checkIfAssignGlobalValue(arrElementInitLval);      //检查是否赋值global
+
+                            MidCode ir = new MidCode(MidType.assign2, arrElementInitLval, arrElementInitvar);
+
+                            ir4init(ir);
+                        }
+                    }
+                }
+            }
+        } else { //没有初值
+            ir4init(arrayir);
+        }
+    }
+
+    public void parseFuncDeclList(ASTNode n) {
+        for (ASTNode leaf : n.getLeafs()) {
+            parseFuncDecl(leaf);
+        }
+    }
+
+    public void parseFuncDecl(ASTNode n) {
+        ASTNode identnode = n.getLeft();
+        String funcname = identnode.getName();
+        NodeKind functype = identnode.getKind();
+
+        //todo 这三个是干啥的？
+        //assignGlobalVar = false;
+        //assignparaArray = false;
+        //hasprintstmt = false;
+
+        //填符号表
+        Symbol funcsymbol = new Symbol(funcname, TableType.FUNC);
+        curFunc = funcsymbol;
+        FuncKind funcKind = functype.equals(NodeKind.VOID) ? FuncKind.VOID : FuncKind.INT;
+        funcsymbol.setFuncKind(funcKind);
+        funcsymbol.setGlobal(isglobal);
+        MidCodeGenerate.insertTable(funcsymbol);
+        //符号表
+
+
+        createIRCode(MidType.funcDecl, functype, funcname);
+
+        MidCodeGenerate.openTable(BlockType.FUNC);
+
+        ASTNode params = identnode.getLeft();
+        if (params != null) {
+            for (ASTNode leaf : params.getLeafs()) {
+                parseFuncFParam(leaf);
+            }
+        }
+
+        parseBlock(n.getRight(),-404);
+        createIRCode(MidType.Note,"#end a func"); //todo 这些注释没用的话其实也可以删了
+        MidCodeGenerate.closeTable();
+
+        //todo 还是那个问题，这里没有呢？我感觉 判断函数有没有用，没有直接加到没用表里
+//        if(funcsymbol.getFuncKind().equals(FuncKind.VOID)){ //void函数没有改变全局，没改变数组参数，没print
+//            if(!assignGlobalVar && !assignparaArray && !hasprintstmt){
+//                unuseFuncs.add(funcsymbol);
+//            }
+//        }
+        curFunc = null;
+    }
+
+private void parseFuncFParam(ASTNode n) {//这里都是identnode
+        String name = n.getName();
+        Symbol symbol  = insertTosymbolTable(n,null);
+        curFunc.addParam(symbol);
+        //MidCodeGenerate.insertTable(symbol); todo 是个bug吧，加了两次，不过好像没有太大问题
+
+        //todo 这里好像可以集到concatraw那里，不管了先理解吧,这里确实可以
+        StringBuilder sb = new StringBuilder();
+        sb.append("para int ");
+        if (n.getKind().equals(NodeKind.INT) || n.getKind().equals(NodeKind.CONSTINT)) {
+            sb.append(name);
+
+        } else if (n.getKind().equals(NodeKind.ARRAY) || n.getKind().equals(NodeKind.CONSTARRAY)) {
+            int dimen = n.getNum();
+            if (dimen == 1) {
+                sb.append(name).append("[]");
+            } else if (dimen == 2) {
+                sb.append(name).append("[][]");
+            }
+        } else {
+            MyError.errorat("Mipsgenrater",300);
+        }
+        //
+        createIRCode(MidType.funcPara, sb.toString());
+    }
+
+
+    public void parseBlock(ASTNode n,int localwhilecount) {
+        for (ASTNode leaf : n.getLeafs()) {
+            parseBlockItem(leaf,localwhilecount);
+        }
+    }
+
+    public void parseBlockItem(ASTNode n,int localwhilecount) {
+        if (n.getType().equals(NodeType.BlockItem_Decl)) {
+            parseDecl(n.getLeft());
+        } else if (n.getType().equals(NodeType.BlockItem_Stmt)) {
+            parseStmt(n.getLeft(),localwhilecount);
+        } else {
+            MyError.errorat("Tablebuilder", 349);
+        }
+    }
+
+    public void parseStmt(ASTNode n,int localwhilecount) {
+        if (n == null || n.getType() == null) { //todo 是不是可以去掉？？
+            return;
+        }
+        NodeType type = n.getType();
+        if(type.equals(NodeType.IfStatement)){
+            // todo add if parseIfStatement(n,localwhilecount);
+        }else if(type.equals(NodeType.While)){
+            //todo add parseWhileLoop(n);
+        }else if(type.equals(NodeType.Return)){
+            if (n.getLeft() != null) {
+                Var t = parseExp(n.getLeft());
+
+                MidCode ir = new MidCode(MidType.Return, t);
+                ir.setVoidreturn(false);  //todo 重要！
+                ir4init(ir);
+
+            } else {
+                MidCode ir = new MidCode(MidType.Return, "void return");
+                ir.setVoidreturn(true);  //todo 重要！
+                ir4init(ir);
+            }
+        }else if (type.equals(NodeType.Continue)){
+            // todo add continue
+//            String ctnstr = "begin_loop" + localwhilecount;//标签
+//            createIRCode(MidType.Note, "#Out Block WhileCut");
+//            createIRCode(MidType.jump, ctnstr);
+        } else if (type.equals(NodeType.Break)) {
+            //todo add break
+//            String breakstr = "end_loop" + localwhilecount;//这是一个标签，好像
+//            createIRCode(MidType.Note, "#Out Block WhileCut");
+//            createIRCode(MidType.jump, breakstr);
+        }else if (type.equals(NodeType.Printf)){
+            parsePrintf(n);
+        }else if(type.equals(NodeType.Block)){
+            boolean localneedblk = true;
+            if (noneedopenblock) {      //noneedblock能抵一次{} while if else自己有block，不用再建block
+                localneedblk = false;
+                noneedopenblock = false;
+            }
+            if (localneedblk) {
+                MidCodeGenerate.openTable(BlockType.BLOCK);
+            }
+
+            parseBlock(n.getLeft(), localwhilecount);
+
+            if (localneedblk) {
+                createIRCode(MidType.Note, "#Out Block");
+                MidCodeGenerate.closeTable();
+            }
+        }else if(type.equals(NodeType.Exp)){
+            if (n.getLeft() != null) {
+                parseExp(n.getLeft());//todo 正确性存疑，看ircode
+            }
+        }else if(type.equals(NodeType.Assign_getint)){
+            Var getintexp = parseLVal(n.getLeft());    //需要LVal而不是Exp处理，因为可能得sw
+            assert getintexp != null;
+            //checkIfAssignGlobalValue(getintexp);//todo  这个函数好像只跟无用函数有关，是不是可以考虑去掉，无用函数也不能优化性能感觉
+            createIRCode(MidType.Getint, getintexp);
+        }else if(type.equals(NodeType.Assign_value)){
+            //todo startindex = midCodes.size();     //初始化ir赋值语句起始位置
+            Var lval = parseLVal(n.getLeft()); //todo 本质上就是parseIdent？【答】不一样，如不需要出临时变量t2
+            Var exp = parseExp(n.getRight());
+
+            assert lval != null;
+            //checkIfAssignGlobalValue(lval);      //检查是否赋值global
+
+            createIRCode(MidType.assign2, lval, exp);
+        }else {
+            MyError.errorat("MIpsgenerator",431);
+        }
+    }
+// todo add if
+
+//    private void parseIfStatement(ASTNode n, int localwhilecount) {
+//        int localifcount = ifcount;   //变为本地，防止嵌套循环 导致 编号混乱的情况
+//        ifcount += 1;
+//
+//        String endifLabel = "end_if" + localifcount;
+//        String endifelseLabel = "end_ifelse" + localifcount;
+//        String intoblocklabel = "into_if" + localifcount;      //主要用于 || 中间判断成立直接跳入
+//
+//        //parseCond(n.getLeft(), endifLabel, intoblocklabel);
+//
+//        //进入基本块
+//        MidCodeGenerate.openTable(BlockType.IF);
+//        noneedopenblock = true;
+//        createIRCode(MidType.Label, intoblocklabel + ":");
+//        //if 块
+//        parseStmt(n.getMiddle(), localwhilecount);
+//
+//
+//        if (n.getRight() != null) { //else块
+//            createIRCode(MidType.Note, "#Out Block");     //出基本块sp移动,必须保证此条code在scope内
+//            createIRCode(MidType.jump, endifelseLabel);       //1、跳到end_if, if结构最后一句; 2、不用再处理sp了，Block负责处理好了
+//            MidCodeGenerate.closeTable();
+//            noneedopenblock = false;
+//
+//            createIRCode(MidType.Label, endifLabel + ":");
+//
+//            MidCodeGenerate.openTable(BlockType.ELSE);
+//            noneedopenblock = true;
+//            parseStmt(n.getRight(), localwhilecount);
+//            MidCodeGenerate.closeTable();
+//            noneedopenblock = false;
+//
+//            createIRCode(MidType.Label, endifelseLabel + ":");
+//
+//        } else {
+//            //todo 没懂这些注释是在干嘛？？？
+//            createIRCode(MidType.Note, "#Out Block");     //出基本块sp移动,必须保证此条code在scope内
+//            MidCodeGenerate.closeTable();
+//            noneedopenblock = false;
+//
+//            createIRCode(MidType.Label, endifLabel + ":");
+//        }
+//    }
+
+//todo add
+
+//    private void parseWhileLoop(ASTNode n) {
+//        int localwhilecount = whilecount;   //变为本地，防止嵌套循环 导致 编号混乱的情况
+//        whilecount += 1;
+//
+//        String beginlabel = "begin_loop" + localwhilecount;
+//        String endlabel = "end_loop" + localwhilecount;
+//        String intoblocklabel = "into_loop" + localwhilecount;      //主要用于 || 中间判断成立直接跳入
+//
+//        int whilestartindex = midCodes.size();
+//
+//        createIRCode(MidType.Label, beginlabel + ":");
+//
+//        //parseCond(n.getLeft(), endlabel, intoblocklabel);
+//
+//        //进入基本块
+//        MidCodeGenerate.openTable(BlockType.WHILE);
+//        MidCodeGenerate.headerTable.startindex = whilestartindex;
+//
+//        noneedopenblock = true;
+//        createIRCode(MidType.Label, intoblocklabel + ":");
+//        parseStmt(n.getRight(), localwhilecount);
+//
+//        createIRCode(MidType.Note, "#Out Block");     //还需要处理sp，修改了Stmt最后一句的Block处理逻辑.必须保证此code在scope内
+//        createIRCode(MidType.Label, beginlabel);
+//        MidCodeGenerate.closeTable();
+//        noneedopenblock = false;
+//
+//        createIRCode(MidType.Label, endlabel + ":");
+//    }
+
+//todo add
+
+//    private void parseCond(ASTNode n, String jumpoutlabel, String jumpinlabel) {      //服务于&&，一旦不成立，跳到jumpoutlabel
+//        NodeType type = n.getType();
+//        String opstring = n.getOpstring();
+//        //todo 是短路求值吗？
+//        if (type.equals(NodeType.OR) || type.equals(NodeType.AND)) {
+//            if (type.equals(NodeType.AND)) {  //一旦不符合，跳到jumpoutlabel
+//                parseCond(n.getLeft(), jumpoutlabel, jumpinlabel);
+//                parseCond(n.getRight(), jumpoutlabel, jumpinlabel);
+//
+//            } else {//todo 这块没懂
+//                String logicORjumpLabel = jumpoutlabel + "_logicOR" + logicORcount;
+//                logicORcount += 1;
+//
+//                parseCond(n.getLeft(), logicORjumpLabel, jumpinlabel);    //left一旦不成立则跳到logicORjumplabel, ||之后紧接着一条branch跳到成立
+//                createIRCode(MidType.jump, jumpinlabel);
+//
+//                createIRCode(MidType.Label, logicORjumpLabel + ":");
+//
+//                parseCond(n.getRight(), jumpoutlabel, jumpinlabel);    //right一旦不成立则跳到jumpoutlabel
+//            }
+//
+//        } else if (opstring.equals("==") || opstring.equals("!=")) { //if(!a)
+//            if (opstring.equals("==")) {  //一旦不符合，跳到jumpoutlabel
+//                Var leftEq = parseEqExp(n.getLeft());     //RelExp是含<、>、<=、>=的Exp
+//                Var rightEq = parseEqExp(n.getRight());
+//                createIRCode(MidType.branch, "bne", jumpoutlabel, leftEq, rightEq);
+//
+//            } else { //if(a)
+//                Var leftEq = parseEqExp(n.getLeft());     //RelExp是含<、>、<=、>=的Exp
+//                Var rightEq = parseEqExp(n.getRight());
+//                createIRCode(MidType.branch, "beq", jumpoutlabel, leftEq, rightEq);
+//            }
+//
+//            //parseEqExp(n);
+//
+//        } else if (OperDiction.hascmp(opstring)) {
+//
+//            Var leftexp = parseRelExp(n.getLeft());
+//            Var rightexp = parseRelExp(n.getRight());
+//
+//            if(opstring.equals(">=")){
+//                createIRCode(MidType.branch, "blt", jumpoutlabel, leftexp, rightexp);
+//            }else if(opstring.equals("<=")) {
+//                createIRCode(MidType.branch, "bgt", jumpoutlabel, leftexp, rightexp);
+//            } else if (opstring.equals(">")) {
+//                createIRCode(MidType.branch, "ble", jumpoutlabel, leftexp, rightexp);
+//            }else {
+//                createIRCode(MidType.branch, "bge", jumpoutlabel, leftexp, rightexp);
+//            }
+//
+//        } else {
+//            if (opstring.equals("!")) {      //应当满足(!nexp)!=0，因此 nexp!=0 立即跳转
+//                Var nexp = parseExp(n.getLeft());
+//                createIRCode(MidType.branch, "bne", jumpoutlabel, nexp, new Var("num", 0));
+//
+//            } else {
+//                //已经是AddExp的情况，应当满足exp!=0，因此 ==0 立即跳转
+//                Var exp = parseExp(n);
+//                createIRCode(MidType.branch, "beq", jumpoutlabel, exp, new Var("num", 0));
+//            }
+//        }
+//    }
+
+//todo add parseeqexp
+
+//    private Var parseEqExp(ASTNode n) {
+//        String opstring = n.getOpstring();
+//        if (opstring.equals("==") || opstring.equals("!=")) {
+//            Var lefteq = parseEqExp(n.getLeft());
+//            Var righteq = parseEqExp(n.getRight());
+//            Var tmpvar = getTmpVar();
+//
+//            if (opstring.equals("==")) {  //需要sne和seq
+//                createIRCode(MidType.setcmp, "seq", tmpvar, lefteq, righteq);
+//            } else {
+//                createIRCode(MidType.setcmp, "sne", tmpvar, lefteq, righteq);
+//            }
+//            return tmpvar;
+//
+//        } else {
+//            return parseRelExp(n);
+//        }
+//    }
+
+    //todo add parseRelExp
+//    private Var parseRelExp(ASTNode n) {
+//        String opstring = n.getOpstring();
+//        if (opstring.equals(">") || opstring.equals("<") || opstring.equals(">=") || opstring.equals("<=")) {
+//            Var leftrel = parseRelExp(n.getLeft());
+//            Var rightrel = parseRelExp(n.getRight());
+//            Var tmpvar = getTmpVar();
+//
+//            switch (opstring) {
+//                case ">=":  //<时branch
+//                    createIRCode(MidType.setcmp, "sge", tmpvar, leftrel, rightrel);
+//                    break;
+//                case "<=":
+//                    createIRCode(MidType.setcmp, "sle", tmpvar, leftrel, rightrel);
+//                    break;
+//                case ">":
+//                    createIRCode(MidType.setcmp, "sgt", tmpvar, leftrel, rightrel);
+//                    break;
+//                case "<":
+//                    createIRCode(MidType.setcmp, "slt", tmpvar, leftrel, rightrel);
+//                    break;
+//                default:
+//                    break;
+//            }
+//            return tmpvar;
+//        } else {
+//            return parseExp(n);
+//        }
+//    }
+
+
+    private void parsePrintf(ASTNode n) {
+        String formatString = n.getLeft().getName();
+        formatString = formatString.substring(1, formatString.length() - 1);
+        //todo 若str为空的情况
+
+        createIRCode(MidType.Note, "#Start Print");
+
+        if (n.getRight() != null) {
+            String[] splits = formatString.split("%d", -1);
+            ASTNode explist = n.getRight();
+            while(i<splits.length){
+                            String splitstr = splits[i];
+                            if (!splitstr.equals("")) {
+                                Var var_splitstr = new Var("str", splitstr);
+                                createIRCode(MidType.Printf, var_splitstr);
+                            }
+
+                            //todo 这又是啥玩意
+                            if (explist.getLeafs() == null || i > explist.getLeafs().size() - 1) {
+                                break;
+                            }
+
+                            ASTNode oneexp = explist.getLeafs().get(i);
+                            Var printexp = parseExp(oneexp);
+                            createIRCode(MidType.Printf, printexp);
+                            i += 1;
+                        }
+        } else {
+            Var var_formatString = new Var("str", formatString);
+            createIRCode(MidType.Printf, var_formatString);
+        }
+    }
+
+
+
+    private Var parseExp(ASTNode n) {
+        NodeType type = n.getType();
+        String opstring = n.getOpstring();
+        if (type.equals(NodeType.Ident)) {
+            //todo 包括函数调用func；整数int；数组array
+
+            Var ident = parseIdent(n);
+
+            if (!n.getKind().equals(NodeKind.FUNC)) {    //todo 访问非func类的 int和array 这里干啥，不知道
+                Symbol symbol = MidCodeGenerate.lookallTableFindsamename(n.getName());
+                assert ident != null;
+                ident.setSymbol(symbol);
+            }
+
+            return ident;
+
+        } else if (type.equals(NodeType.Number)) { //如果是数字，不生成，直接返回
+            return new Var("num", n.getNum());
+
+        } else if (OperDiction.hasOperator(opstring)) {
+            if(opstring.equals("+")){
+                            if (n.getRight() != null) {
+                                return generateOperatorIR(n, "+");
+                            }
+                            return parseExp(n.getLeft());
+                        }else if(opstring.equals("-")){
+                            if (n.getRight() != null) {
+                                return generateOperatorIR(n, "-");
+                            }
+
+                            Var leftexp = new Var("num", 0);
+                            Var rightexp = parseExp(n.getLeft());
+
+                            if (rightexp.getType().equals("num")) {
+                                return new Var("num", -rightexp.getNum());
+
+                            } else {
+                                Var tmpvar = getTmpVar();
+
+                                createIRCode(MidType.assign, "-", tmpvar, leftexp, rightexp);
+                                return tmpvar;
+                            }
+                        }else if(opstring.equals("*")){
+                            return generateOperatorIR(n, "*");
+                        }else if(opstring.equals("/")){
+                            return generateOperatorIR(n, "/");
+                        }else if(opstring.equals("%")){
+                            return generateOperatorIR(n, "%");
+                        }else {
+                            MyError.errorat("MidcodeGen",395);
+                            return null;
+                        }
+        } else if (opstring.equals("!")) {
+            Var nexp = parseExp(n.getLeft());
+            Var tmpvar = getTmpVar();
+            createIRCode(MidType.setcmp, "seq", tmpvar, nexp, new Var("num", 0));    //seq tmpvar等于0置1
+            return tmpvar;
+
+        } else {
+            System.err.println("IRGenerator / parseExp() :??? what type ??? type = " + type);
+            return null;
+        }
+    }
+
+
+    private Var parseLVal(ASTNode n) {
+        NodeKind kind = n.getKind();
+
+        if (kind.equals(NodeKind.INT) || kind.equals(NodeKind.CONSTINT)) {
+            Var lval = new Var("var", n.getName());
+
+            Symbol symbol = MidCodeGenerate.lookallTableFindsamename(n.getName());
+
+            lval.setSymbol(symbol);
+            lval.setiskindofsymbolTrue();
+
+            return lval;
+
+        } else if (kind.equals(NodeKind.ARRAY) || kind.equals(NodeKind.CONSTARRAY)) {
+            return parseArrayVisit(n);
+
+        } else {
+            System.out.println("IRGenerator / parseLVal(): ??? kind = " + kind);
+            return null;
+        }
+    }
+
+    private Var parseIdent(ASTNode n) {
+        MyError.sout("In parseIdent "+n.getName()+" "+n.getKind());
+        NodeKind kind = n.getKind();
+
+        if (kind.equals(NodeKind.INT) || kind.equals(NodeKind.CONSTINT)) {
+            if (kind.equals(NodeKind.CONSTINT)) {     //优化
+                String name = n.getName();
+                Symbol symbol = MidCodeGenerate.lookallTableFindsamename(name);
+                int num = symbol.getNum();
+                return new Var("num", num);
+
+            } else {
+                Var intvar = new Var("var", n.getName());
+                intvar.setiskindofsymbolTrue();     //todo 一直没理解这里有啥用，设置为kind of symbol
+                return intvar;
+            }
+
+        } else if (kind.equals(NodeKind.ARRAY) || kind.equals(NodeKind.CONSTARRAY)) {
+            if (kind.equals(NodeKind.CONSTARRAY)) { // 访问常量数组
+                return parseConstArrayVisit(n);
+
+            } else {
+                //todo startindex = midCodes.size();     //初始化ir赋值语句起始位置
+                Var name_and_index = parseArrayVisit(n);
+                Var tmpvar = getTmpVar();
+
+                createIRCode(MidType.assign2, tmpvar, name_and_index);
+                return tmpvar;
+            }
+
+        } else if (kind.equals(NodeKind.FUNC)) {   //函数调用！！！！！！！
+            String funcname = n.getName();
+            ASTNode rparams = n.getLeft();
+
+
+            Symbol func = MidCodeGenerate.lookGlobalTableFindsamename(funcname);
+
+            //if (!unuseFuncs.contains(func)) { // todo 无用函数表到底有没有用？？？？
+                if (rparams != null) {      //函数有参数则push
+                    for (int i = 0; i < rparams.getLeafs().size(); i++) {
+                        ASTNode para = rparams.getLeafs().get(i);
+
+                        Symbol fparami = func.getParams().get(i); //函数的第i个参数类型
+                        int arraydimen = fparami.getDimension();
+
+                        if (fparami.isArray()) {       //如果是array类型的函数参数
+                            Var paraexp = parseParaArray(para, arraydimen);       //需返回array类型
+                            createIRCode(MidType.Push, paraexp);
+
+                        } else {
+                            Var paraexp = parseExp(para);      //正常的var类型exp
+                            createIRCode(MidType.Push, paraexp);
+                        }
+                    }
+                //}
+
+                //call
+                MidCode ir = new MidCode(MidType.call, funcname);
+                ir.setSymbol(func);
+                ir4init(ir);
+
+                //ret
+                if (func.getFuncKind() != null && !func.getFuncKind().equals(FuncKind.VOID)) {
+                    Var tmpvar = getTmpVar();
+                    createIRCode(MidType.assign_ret, tmpvar);
+                    return tmpvar;
+                }
+                return null;
+
+            } else {
+                return null;    //todo viod类型函数返回值
+            }
+
+        }
+        MyError.errorat("Midgen",801,"不知道ident是什么类型");
+        return null;
+    }
+
+    private Var parseParaArray(ASTNode n, int arrdimen) {     //为函数传参服务，只返回array类型，arrdimen是参数应当的维度
+        String name = n.getName();
+
+        Symbol arraysymbol = MidCodeGenerate.lookallTableFindsamename(name);
+
+        Var arrayident = new Var("array", name);
+
+        if (arraysymbol.getDimension() == 2  && arrdimen == 1) {   //二维数组传一维，需要记录一维数组下标
+
+                Var numvar = parseExp(n.getLeft());        //数组第一维下标
+                arrayident.setVar(numvar);
+        }
+        //其他直接传入
+        arrayident.setSymbol(arraysymbol);
+        arrayident.setiskindofsymbolTrue(); //todo 也许不用
+        return arrayident;
+    }
+
+    //todo add
+    private Var parseArrayVisit(ASTNode n) {
+
+        //MyError.sout("Array Vist!!!!!!!!!! "+n.getName()+" "+n.getKind());
+        System.out.println(n.getKind());
+        String name = n.getName();   //指id
+
+        Symbol array = MidCodeGenerate.lookallTableFindsamename(name);
+
+        if (array.getDimension() == 2) {   //二维数组处理成一维如a[t1]
+            int arraydimen2 = array.getDimen2();
+
+            Var var_x = parseExp(n.getLeft());
+            Var var_arraydimen2 = new Var("num", arraydimen2);
+            Var var_y = parseExp(n.getRight());
+
+            if (var_x.getType().equals("num")) {
+                if (var_y.getType().equals("num")) {
+                    //var array 两个下标都是常数，不能直接返回num变量，因为这里如果是个函数值就完蛋了，得运行时算
+                    int offsetnum = var_x.getNum() * arraydimen2 + var_y.getNum();
+                    Var offset = new Var("num", offsetnum);
+                    Var retVar = new Var("array", name, offset);
+                    retVar.setSymbol(array);    //只设置symbol，但不可kindofSymbol=True
+                    return retVar;
+
+                } else {
+                    return getVariable(name, array, arraydimen2, var_x, var_y);
+                }
+
+            } else {
+                return getVariable2(name, array, var_x, var_arraydimen2, var_y);
+            }
+
+        } else {    //一维数组正常访问
+            Var var_x = parseExp(n.getLeft());
+            Var retVar = new Var("array", name, var_x);
+            retVar.setSymbol(array);
+            return retVar;
+        }
+    }
+
+
+    private Var getVariable2(String name, Symbol array, Var var_x, Var var_arraydimen2, Var var_y) {
+        //二维数组生成下标变量
+        Var tmpvar1 = getTmpVar();
+        createIRCode(MidType.assign, "*", tmpvar1, var_x, var_arraydimen2);
+
+        Var offset = getTmpVar();
+
+        createIRCode(MidType.assign, "+", offset, var_y, tmpvar1);
+
+        Var retVar = new Var("array", name, offset);
+        retVar.setSymbol(array);    //只设置symbol，但不可kindofSymbol=True
+        return retVar;
+    }
+
+    private Var getVariable(String name, Symbol array, int arraydimen2, Var var_x, Var var_y) {
+        //一维数组生成下标变量
+        int t1num = var_x.getNum() * arraydimen2;
+        Var t1 = new Var("num", t1num);
+        Var offset = getTmpVar();
+        createIRCode(MidType.assign, "+", offset, var_y, t1);
+        Var retVar = new Var("array", name, offset);
+        retVar.setSymbol(array);    //只设置symbol，但不可kindofSymbol=True
+        return retVar;
+    }
+
+
+    //常量直接取array num
+    private Var parseConstArrayVisit(ASTNode n) {
+        String name = n.getName();   //指id
+        Symbol array = MidCodeGenerate.lookallTableFindsamename(name);
+
+
+        //常量数组访问直接可以计算，不用再搞这些了
+
+        if (array.getDimension() == 2) {   //二维数组处理成一维如a[t1]
+            int arraydimen2 = array.getDimen2();
+
+            Var var_x = parseExp(n.getLeft());
+            Var var_arraydimen2 = new Var("num", arraydimen2);
+            Var var_y = parseExp(n.getRight());
+
+            assert var_x != null;
+            if (var_x.getType().equals("num")) {
+                assert var_y != null;
+                if (var_y.getType().equals("num")) {
+                    //const array 两个下标都是常数，直接返回num变量
+                    int offsetnum = var_x.getNum() * arraydimen2 + var_y.getNum();
+                    MyError.sout("Offset "+name+" "+offsetnum);
+                    int arrayvalue = array.getArrayValue().get(offsetnum);
+                    return new Var("num", arrayvalue);
+
+                } else {
+                    return getVariable(name, array, arraydimen2, var_x, var_y);
+                }
+
+            } else {
+                return getVariable2(name, array, var_x, var_arraydimen2, var_y);
+            }
+
+        } else {
+
+            Var var_x = parseExp(n.getLeft());
+            Var retVar = null;
+
+            assert var_x != null;
+            if(var_x.getType().equals("num")){
+                //MyError.sout("Offset "+name+" "+var_x.getNum());
+                int offset = var_x.getNum();
+                retVar = new Var("num",array.getArrayValue().get(offset));
+            }else {
+                retVar = new Var("array", name, var_x);
+            }
+            retVar.setSymbol(array);
+            return retVar;
+        }
+    }
+
+    public static Symbol lookallTableFindsamename(String name) {  //找不到同名，返回null，优先查找同符号表，顺次向上查父符号表
+        Table t = headerTable;
+        Symbol samename = t.sameNameSymbol(name);
+        if (samename == null) {
+            while (t.getFather() != null) {
+                t = t.getFather();
+                samename = t.sameNameSymbol(name);
+                if (samename != null) {
+                    return samename;
+                }
+            }
+            return null;
+        }
+        return samename;
+    }
+
+    public static Symbol lookGlobalTableFindsamename(String name){
+        Table t = foreverGlobalTAble;
+        return t.sameNameSymbol(name);
+    }
+    private Var getTmpVar() {
+        varcount += 1;
+        String name = "#tmp" + varcount;
+        Var var = new Var("var", name);
+        var.scope = MidCodeGenerate.headerTable;
+        return var;
+    }
+
+    private void ir4init(MidCode ir) {
+        ir.setGlobal(isglobal);
+        ir.setScope(headerTable);
+        ir.initRawstr();
+
+        //new todo 不知道要干嘛这个 先没写
+        //ir.startindex = startindex;
+
+        midCodes.add(ir);
+    }
+
+    private void createIRCode(MidType type, String IRstring) {
+        MidCode ir = new MidCode(type, IRstring);
+        ir4init(ir);
+    }
+
+    private void createIRCode(MidType type, Var var) {
+        MidCode ir = new MidCode(type, var);
+        ir4init(ir);
+    }
+
+
+
+    //assign2
+    private void createIRCode(MidType type, Var dest, Var oper1) {
+        MidCode ir = new MidCode(type, dest, oper1);
+        ir4init(ir);
+    }
+
+    //assign
+    private void createIRCode(MidType type, String operator, Var dest, Var oper1, Var oper2) {
+        MidCode ir = new MidCode(type, operator, dest, oper1, oper2);
+        ir4init(ir);
+    }
+
+    //Cond branch部分专用
+    private void createIRCode(MidType type, String instr, String jumploc, Var oper1, Var oper2) {
+        MidCode ir = new MidCode(type, instr, jumploc, oper1, oper2);
+        ir4init(ir);
+    }
+
+    public Symbol insertTosymbolTable(ASTNode identnode,ASTNode init) { //为数组，int的定义填写符号表
+        String name = identnode.getName();
+        NodeKind kind = identnode.getKind();
+        //MyError.sout("INsert into table "+name+" "+kind);
+
+        Symbol symbol = null;
+        if (kind.equals(NodeKind.ARRAY) || kind.equals(NodeKind.CONSTARRAY)) {
+            symbol = new Symbol(name, TableType.ARRAY);
+
+            if (kind.equals(NodeKind.CONSTARRAY)) {
+                symbol.setConstType(ConstType.CONST);
+            } else {
+                symbol.setConstType(ConstType.VAR);
+            }
+
+            ASTNode dimen1 = identnode.getLeft();
+            int dimen1num = dimen1.calcuValue();
+            symbol.setDimen1(dimen1num);
+            symbol.setDimension(1);
+
+            int dimen2num = 0;
+            if (identnode.getRight() != null) {
+                ASTNode dimen2 = identnode.getRight();
+                dimen2num = dimen2.calcuValue();
+                symbol.setDimen2(dimen2num);
+                symbol.setDimension(2);
+            }
+
+            //这里只把常量数组或者global数组的init加进去了，因为这里如果是局部的vararray，其值有可能是运行时才得知
+            if (init != null && (kind.equals(NodeKind.CONSTARRAY)) || isglobal) {
+                if (dimen2num == 0) {//一维数组
+                    for (int i = 0; i < dimen1num; i++) {
+                        int initnum = init.getLeafs().get(i).calcuValue();
+                        symbol.addArraynum(initnum);
+                    }
+                } else {//二维  int a[4][4] = {{1, 2, 3, 4},{0,0,0,0}, {0,0,0,0},{1,2,3,4}};
+                    for (int i = 0; i < dimen1num; i++) {
+                        for (int j = 0; j < dimen2num; j++) {
+                            int initnum = init.getLeafs().get(i).getLeafs().get(j).calcuValue();
+                            symbol.addArraynum(initnum);
+                        }
+                    }
+                }
+            }
+        } else { //int 和 const int
+            symbol = new Symbol(name, TableType.INTEGER);
+            if (identnode.getKind().equals(NodeKind.CONSTINT)) {
+                symbol.setConstType(ConstType.CONST);
+            } else if(identnode.getKind().equals(NodeKind.INT)) {
+                symbol.setConstType(ConstType.VAR);
+            }
+
+            //const编译时一定能算，Var不一定，var需要运行时算
+
+            if (init != null && ((kind.equals(NodeKind.CONSTINT)) || isglobal)) {
+                int constinitnum = init.calcuValue();
+                symbol.setNum(constinitnum);
+            }
+        }
+        symbol.setGlobal(isglobal);
+        MidCodeGenerate.insertTable(symbol);
+        return symbol;
+    }
+
+    private Var generateOperatorIR(ASTNode n, String op) {
+        Var leftexp = parseExp(n.getLeft());
+        Var rightexp = parseExp(n.getRight());
+
+        if (leftexp.getType().equals("num") && rightexp.getType().equals("num")) { //左面是数，右边是数，直接计算完返回就行
+            int leftnum = leftexp.getNum();
+            int rightnum = rightexp.getNum();
+
+            Var newvar = null;
+                        if(op.equals("+")){
+                            newvar = new Var("num", leftnum + rightnum);
+                        }else if(op.equals("-")){
+                            newvar = new Var("num", leftnum - rightnum);
+                        }else if(op.equals("*")){
+                            newvar = new Var("num", leftnum * rightnum);
+                        }else if(op.equals("/")){
+                            newvar = new Var("num", leftnum / rightnum);
+                        }else if(op.equals("%")){
+                            newvar = new Var("num", leftnum % rightnum);
+                        }else {
+                            MyError.errorat("Midgenrater",1096,"这里是啥符号？？");
+                        }
+                        return newvar;
+        } else { //有不是数的东西，申请一个tmp，运行时计算
+            Var tmpvar = getTmpVar();
+            createIRCode(MidType.assign, op, tmpvar, leftexp, rightexp);
+            return tmpvar;
+        }
+    }
+
+//    private void checkIfAssignGlobalValue(Var var) {
+//        if (var.getSymbol() != null) {
+//            Symbol sb = var.getSymbol();
+//            if (sb.isGlobal()) {
+//                assignGlobalVar = true;
+//
+//            } else if (curFunc != null && sb.isArray() && curFunc.getParams().contains(sb)) {
+//                assignparaArray = true;
+//            }
+//        }
+//    }
+
+    private void createIRCode(MidType type, NodeKind kind, String  name) {
+        MidCode ir = new MidCode(type, kind, name);
+        ir4init(ir);
+    }
+}
